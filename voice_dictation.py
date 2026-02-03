@@ -18,6 +18,7 @@ import queue
 import time
 import sys
 import json
+import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -25,9 +26,266 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 import pyautogui
-import winsound
 from pynput import keyboard
 from faster_whisper import WhisperModel
+
+# =============================================================================
+# Status Indicator (Floating Visual Feedback)
+# =============================================================================
+
+class StatusIndicator:
+    """
+    A small floating tab at the bottom of the screen showing dictation state.
+    Inspired by WisprFlow's minimal, beautiful design.
+    
+    States:
+    - idle: Subtle dark pill (barely visible, ready)
+    - recording: Glowing red with smooth breathing animation
+    - transcribing: Pulsing amber/gold
+    """
+    
+    # Dimensions (small pill/tab shape)
+    WIDTH = 80
+    HEIGHT = 24
+    CORNER_RADIUS = 12
+    
+    # Color palettes for smooth transitions
+    COLORS = {
+        "idle": {
+            "fill": "#2a2a2a",
+            "glow": "#3a3a3a",
+        },
+        "recording": {
+            "fill_bright": "#ff3b30",
+            "fill_dim": "#cc2d25",
+            "glow_bright": "#ff6b60",
+            "glow_dim": "#aa2820",
+        },
+        "transcribing": {
+            "fill_bright": "#ffcc00",
+            "fill_dim": "#e6b800",
+            "glow": "#ffd633",
+        },
+    }
+    
+    def __init__(self):
+        self.root = None
+        self.canvas = None
+        self.pill = None
+        self.inner_pill = None  # Inner highlight for depth
+        self.state = "idle"
+        self.animation_phase = 0.0
+        self._running = False
+        self._thread = None
+        self._visible = False  # Start hidden
+        self._hide_timer_id = None  # For auto-hide after idle
+        
+    def start(self):
+        """Start the indicator in a separate thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._run_gui, daemon=True)
+        self._thread.start()
+        # Give tkinter time to initialize
+        time.sleep(0.2)
+    
+    def _create_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        """Create a rounded rectangle on the canvas."""
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1,
+        ]
+        return self.canvas.create_polygon(points, smooth=True, **kwargs)
+    
+    def _run_gui(self):
+        """Run the tkinter mainloop in this thread."""
+        self.root = tk.Tk()
+        self.root.title("")
+        
+        # Remove window decorations and make it always on top
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.9)
+        
+        # Start hidden - withdraw the window initially
+        self.root.withdraw()
+        
+        # Transparent background
+        self.root.attributes("-transparentcolor", "#010101")
+        self.root.configure(bg="#010101")
+        
+        # Position at bottom center of screen (above taskbar)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - self.WIDTH) // 2
+        y = screen_height - self.HEIGHT - 70  # 70px from bottom to clear taskbar
+        
+        self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        
+        # Create canvas
+        self.canvas = tk.Canvas(
+            self.root, 
+            width=self.WIDTH, 
+            height=self.HEIGHT,
+            bg="#010101",
+            highlightthickness=0
+        )
+        self.canvas.pack()
+        
+        # Draw the main pill (outer glow/border)
+        self.pill = self._create_rounded_rect(
+            1, 1, self.WIDTH - 1, self.HEIGHT - 1,
+            self.CORNER_RADIUS,
+            fill=self.COLORS["idle"]["fill"],
+            outline="",
+            width=0
+        )
+        
+        # Draw inner pill for subtle depth effect
+        self.inner_pill = self._create_rounded_rect(
+            3, 3, self.WIDTH - 3, self.HEIGHT - 3,
+            self.CORNER_RADIUS - 2,
+            fill=self.COLORS["idle"]["glow"],
+            outline="",
+            width=0
+        )
+        
+        # Start animation loop
+        self._animate()
+        
+        # Run the mainloop
+        self.root.mainloop()
+    
+    def _interpolate_color(self, color1, color2, t):
+        """Interpolate between two hex colors. t is 0.0 to 1.0."""
+        r1, g1, b1 = int(color1[1:3], 16), int(color1[3:5], 16), int(color1[5:7], 16)
+        r2, g2, b2 = int(color2[1:3], 16), int(color2[3:5], 16), int(color2[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+    
+    def _animate(self):
+        """Minimal, clean animation - just subtle glow pulsing."""
+        if not self._running or not self.root:
+            return
+        
+        import math
+        
+        # Slow, smooth breathing (not distracting)
+        self.animation_phase = (self.animation_phase + 0.05) % (2 * math.pi)
+        breath = (math.sin(self.animation_phase) + 1) / 2  # 0.0 to 1.0
+        
+        try:
+            if self.state == "recording":
+                # Subtle red glow pulse
+                colors = self.COLORS["recording"]
+                outer = self._interpolate_color(colors["fill_dim"], colors["fill_bright"], breath)
+                inner = self._interpolate_color(colors["glow_dim"], colors["glow_bright"], breath)
+                self.canvas.itemconfig(self.pill, fill=outer)
+                self.canvas.itemconfig(self.inner_pill, fill=inner)
+                
+            elif self.state == "transcribing":
+                # Slightly faster amber pulse for processing
+                colors = self.COLORS["transcribing"]
+                fast_breath = (math.sin(self.animation_phase * 1.5) + 1) / 2
+                outer = self._interpolate_color(colors["fill_dim"], colors["fill_bright"], fast_breath)
+                self.canvas.itemconfig(self.pill, fill=outer)
+                self.canvas.itemconfig(self.inner_pill, fill=colors["glow"])
+                
+        except tk.TclError:
+            pass
+        
+        # ~30fps, smooth enough without being resource-heavy
+        if self._running and self.root:
+            self.root.after(33, self._animate)
+    
+    def set_state(self, state: str):
+        """
+        Update the indicator state. Thread-safe.
+        
+        Args:
+            state: One of "idle", "recording", "transcribing"
+        """
+        self.state = state
+        
+        if state in ("recording", "transcribing"):
+            # Show when active, cancel any pending hide
+            self.show()
+            self._cancel_hide_timer()
+        elif state == "idle":
+            # Start timer to hide after 3 seconds of idle
+            self._schedule_hide()
+        
+        if self.root and self.canvas and self.pill:
+            def update_color():
+                try:
+                    if state == "idle":
+                        colors = self.COLORS["idle"]
+                        self.canvas.itemconfig(self.pill, fill=colors["fill"])
+                        self.canvas.itemconfig(self.inner_pill, fill=colors["glow"])
+                except tk.TclError:
+                    pass
+            
+            try:
+                self.root.after(0, update_color)
+            except:
+                pass
+    
+    def show(self):
+        """Show the indicator window."""
+        if self.root and not self._visible:
+            try:
+                self.root.after(0, self.root.deiconify)
+                self._visible = True
+            except:
+                pass
+    
+    def hide(self):
+        """Hide the indicator window."""
+        if self.root and self._visible:
+            try:
+                self.root.after(0, self.root.withdraw)
+                self._visible = False
+            except:
+                pass
+    
+    def _schedule_hide(self):
+        """Schedule hiding the indicator after 3 seconds."""
+        self._cancel_hide_timer()
+        if self.root:
+            try:
+                self._hide_timer_id = self.root.after(3000, self.hide)
+            except:
+                pass
+    
+    def _cancel_hide_timer(self):
+        """Cancel any pending hide timer."""
+        if self._hide_timer_id and self.root:
+            try:
+                self.root.after_cancel(self._hide_timer_id)
+            except:
+                pass
+            self._hide_timer_id = None
+    
+    def stop(self):
+        """Stop the indicator and close the window."""
+        self._running = False
+        if self.root:
+            try:
+                # Use quit() to break the mainloop, then destroy
+                self.root.after(0, self.root.quit)
+            except:
+                pass
 
 # =============================================================================
 # Configuration
@@ -37,11 +295,6 @@ HOTKEY = keyboard.Key.f4  # Push-to-talk key
 SAMPLE_RATE = 16000       # Whisper requires 16kHz audio
 CHANNELS = 1              # Mono audio
 MODEL_SIZE = "base.en"    # English-only base model for speed
-
-# Audio feedback frequencies (Hz)
-BEEP_START_FREQ = 800     # Higher pitch for "start listening"
-BEEP_STOP_FREQ = 400      # Lower pitch for "stop listening"
-BEEP_DURATION_MS = 100    # Short beep duration
 
 # History file path (same directory as script)
 HISTORY_FILE = Path(__file__).parent / "dictation_history.jsonl"
@@ -150,24 +403,6 @@ class HistoryLogger:
             return entries[-limit:]
         return entries
 
-# =============================================================================
-# Audio Feedback
-# =============================================================================
-
-def play_start_beep():
-    """Play a high-frequency beep to indicate recording has started."""
-    # Run in thread to avoid blocking
-    threading.Thread(
-        target=lambda: winsound.Beep(BEEP_START_FREQ, BEEP_DURATION_MS),
-        daemon=True
-    ).start()
-
-def play_stop_beep():
-    """Play a lower-frequency beep to indicate recording has stopped."""
-    threading.Thread(
-        target=lambda: winsound.Beep(BEEP_STOP_FREQ, BEEP_DURATION_MS),
-        daemon=True
-    ).start()
 
 # =============================================================================
 # Whisper Model Management
@@ -259,10 +494,11 @@ class DictationController:
     - Transcription doesn't freeze the UI
     """
     
-    def __init__(self, model: WhisperModel):
+    def __init__(self, model: WhisperModel, indicator: StatusIndicator):
         self.model = model
         self.state = DictationState()
         self.history = HistoryLogger()
+        self.indicator = indicator
         self.transcription_thread: Optional[threading.Thread] = None
         self.recording_start_time: Optional[float] = None
         
@@ -284,7 +520,7 @@ class DictationController:
         if self.state.is_recording:
             return  # Already recording
         
-        play_start_beep()
+        self.indicator.set_state("recording")
         self.state.start_recording()
         self.recording_start_time = time.time()
         
@@ -314,11 +550,12 @@ class DictationController:
         audio = self.state.stop_recording()
         duration = time.time() - self.recording_start_time if self.recording_start_time else 0
         self.recording_start_time = None
-        play_stop_beep()
+        self.indicator.set_state("transcribing")
         print("[...] Processing...")
         
         if len(audio) == 0:
             print("No audio recorded.")
+            self.indicator.set_state("idle")
             return
         
         # Run transcription in a separate thread to avoid blocking the listener
@@ -341,6 +578,8 @@ class DictationController:
                     print("No speech detected.")
             except Exception as e:
                 print(f"Transcription error: {e}", file=sys.stderr)
+            finally:
+                self.indicator.set_state("idle")
         
         self.transcription_thread = threading.Thread(target=transcribe_and_type, daemon=True)
         self.transcription_thread.start()
@@ -370,6 +609,8 @@ class DictationController:
                 pass
             self.state.stream = None
         self.state.is_recording = False
+        # Stop the indicator
+        self.indicator.stop()
     
     def run(self):
         """Start the dictation system."""
@@ -393,7 +634,9 @@ class DictationController:
             print("\nCtrl+C detected. Exiting...")
             self.cleanup()
             self.listener.stop()
-            sys.exit(0)
+            # Force exit to avoid hanging on daemon threads
+            import os
+            os._exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
         
@@ -408,6 +651,8 @@ class DictationController:
             print("\nCtrl+C detected. Exiting...")
             self.cleanup()
             self.listener.stop()
+            import os
+            os._exit(0)
 
 # =============================================================================
 # Main Entry Point
@@ -428,13 +673,19 @@ def main():
     _ = transcribe_audio(model, dummy_audio)
     print("[OK] Model ready!\n")
     
+    # Start the visual status indicator
+    indicator = StatusIndicator()
+    indicator.start()
+    
     # Create and run the controller
-    controller = DictationController(model)
+    controller = DictationController(model, indicator)
     
     try:
         controller.run()
     except KeyboardInterrupt:
         print("\nInterrupted by user")
+    finally:
+        indicator.stop()
 
 if __name__ == "__main__":
     main()
